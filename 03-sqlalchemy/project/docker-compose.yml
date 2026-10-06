@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: tenders-postgres
+    container_name: tasks-postgres
     restart: unless-stopped
 
     environment:
