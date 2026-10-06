@@ -1,8 +1,15 @@
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from db import Base, TaskDB, engine, get_db
+
+# Create the tables if they don't exist yet (fine for learning; use Alembic later).
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Task Management API")
 
@@ -19,11 +26,14 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Models
+# Schemas (API layer, Pydantic)
 # ---------------------------------------------------------------------------
 
 
 class Task(BaseModel):
+    # Lets Pydantic read attributes from a TaskDB object (not just from dicts).
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     title: str
     done: bool = False
@@ -40,14 +50,6 @@ class TaskUpdate(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# In-memory storage (replace with a real database for production use)
-# ---------------------------------------------------------------------------
-
-tasks: Dict[int, Task] = {}
-_next_id: int = 1
-
-
-# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -58,37 +60,42 @@ def root() -> dict:
 
 
 @app.post("/tasks", response_model=Task, status_code=201)
-def create_task(payload: TaskCreate) -> Task:
-    global _next_id
+def create_task(payload: TaskCreate, db: Session = Depends(get_db)) -> TaskDB:
     title = payload.title.strip()
     if not title:
         raise HTTPException(status_code=422, detail="Title cannot be empty")
 
-    task = Task(id=_next_id, title=title, done=payload.done)
-    tasks[task.id] = task
-    _next_id += 1
+    task = TaskDB(title=title, done=payload.done)
+    db.add(task)
+    db.commit()
+    db.refresh(task)
     return task
 
 
 @app.get("/tasks", response_model=List[Task])
-def get_tasks(done: Optional[bool] = Query(default=None)) -> List[Task]:
-    result = list(tasks.values())
+def get_tasks(
+    done: Optional[bool] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    stmt = select(TaskDB).order_by(TaskDB.id)
     if done is not None:
-        result = [t for t in result if t.done == done]
-    return result
+        stmt = stmt.where(TaskDB.done == done)
+    return db.scalars(stmt).all()
 
 
 @app.get("/tasks/{task_id}", response_model=Task)
-def get_task(task_id: int) -> Task:
-    task = tasks.get(task_id)
+def get_task(task_id: int, db: Session = Depends(get_db)) -> TaskDB:
+    task = db.get(TaskDB, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
 
 
 @app.put("/tasks/{task_id}", response_model=Task)
-def update_task(task_id: int, payload: TaskUpdate) -> Task:
-    task = tasks.get(task_id)
+def update_task(
+    task_id: int, payload: TaskUpdate, db: Session = Depends(get_db)
+) -> TaskDB:
+    task = db.get(TaskDB, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -99,13 +106,17 @@ def update_task(task_id: int, payload: TaskUpdate) -> Task:
             raise HTTPException(status_code=422, detail="Title cannot be empty")
         updates["title"] = new_title
 
-    updated_task = task.model_copy(update=updates)
-    tasks[task_id] = updated_task
-    return updated_task
+    for field, value in updates.items():
+        setattr(task, field, value)
+    db.commit()
+    db.refresh(task)
+    return task
 
 
 @app.delete("/tasks/{task_id}", status_code=204)
-def delete_task(task_id: int) -> None:
-    if task_id not in tasks:
+def delete_task(task_id: int, db: Session = Depends(get_db)) -> None:
+    task = db.get(TaskDB, task_id)
+    if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    del tasks[task_id]
+    db.delete(task)
+    db.commit()
